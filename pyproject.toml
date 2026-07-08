@@ -8,6 +8,7 @@ authors = [
 ]
 dependencies = [
   "colorlog~=6.9",
+  "cryptography>=42.0.0",
   "grpcio-tools~=1.66",
   "grpcio~=1.66",
   "numpy~=1.24; python_version >= '3.10' and python_version < '3.13'",
@@ -38,7 +39,6 @@ requires-python = ">=3.10,<3.14"  # This is the main Python version requirement
 documentation = "https://TekHSI.readthedocs.io"
 homepage = "https://pypi.org/project/TekHSI/"
 repository = "https://github.com/tektronix/TekHSI"
-
 
 [tool.coverage.paths]
 source = [
@@ -264,6 +264,7 @@ addopts = "--order-scope=module --cov-config=pyproject.toml"
 doctest_optionflags = "ELLIPSIS NORMALIZE_WHITESPACE IGNORE_EXCEPTION_DETAIL"
 filterwarnings = [
   "ignore:Type google._upb._message.:DeprecationWarning",
+  "ignore:authlib\\.jose module is deprecated.*:DeprecationWarning",
 ]
 junit_family = "xunit2"
 junit_logging = "all"

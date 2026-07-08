@@ -32,8 +32,23 @@ from tekhsi._tek_highspeed_server_pb2 import (  # pylint: disable=no-name-in-mod
     WaveformRequest,
 )
 from tekhsi._tek_highspeed_server_pb2_grpc import ConnectStub, NativeDataStub
+from tekhsi.auth_basic import DEFAULT_MODE3_USERNAME
+from tekhsi.credential_store import TekCredentialStore, TekHSICredentialStore
 from tekhsi.helpers.enums import WaveformType  # Added for enum-based waveform type checks
 from tekhsi.helpers.logging import configure_logging
+from tekhsi.security import (  # pylint: disable=import-private-name
+    _auto_negotiate_channel,
+    _build_creds_from_entry,
+    _call_on_trust,
+    _fetch_server_cert,
+    _parse_host_port,
+    _resolve_credentials_from_store,
+    _secure_channel,
+    TekAuthenticationFailed,
+    TekCertificateMismatch,
+    TekHSICredentials,
+    TekSecurityError,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -61,6 +76,7 @@ class AcqWaitOn(Enum):
         ...     with connection.access_data(AcqWaitOn.NextAcq):
         ...         ...
     """
+
     Time = 2
     """Wait for a specific time.
 
@@ -76,6 +92,7 @@ class AcqWaitOn(Enum):
         ...     with connection.access_data(AcqWaitOn.Time, after=0.5):
         ...         ...
     """
+
     AnyAcq = 3
     """Wait for any acquisition."""
     NewData = 4
@@ -109,12 +126,18 @@ class TekHSIConnect:  # pylint:disable=too-many-instance-attributes
     ################################################################################################
     # Magic Methods
     ################################################################################################
-    def __init__(  # noqa: PLR0915
+    def __init__(  # noqa: PLR0915, PLR0913  # pylint: disable=too-many-locals
         self,
         url: str,
         activesymbols: list[str] | None = None,
         callback: Callable | None = None,
         data_filter: Callable | None = None,
+        credentials: grpc.ChannelCredentials | TekHSICredentials | None = None,
+        credential_store: TekHSICredentialStore | None = None,
+        on_trust_prompt: Callable[..., bool | tuple[bool, str | None]] | None = None,
+        *,
+        require_tls: bool = False,
+        timeout: float = 10.0,
     ) -> None:
         """Initialize a connection to a Tektronix instrument using gRPC.
 
@@ -132,6 +155,16 @@ class TekHSIConnect:  # pylint:disable=too-many-instance-attributes
                 all acquisitions are accepted. However, if customer behavior is desired, then this
                 method can be provided. Typically, these functions are used to look for specific
                 kinds of changes, such as record length changing.
+            credentials: Optional TLS or TLS+Basic credentials. When omitted with no other
+                security parameters, the legacy plaintext channel is used unchanged.
+            credential_store: Optional credential store for trust and passwords. When omitted
+                but another security parameter is set, the default platform store is used.
+            on_trust_prompt: Callback invoked for trust-on-first-use or when the server
+                requires a password after TLS trust is established.
+            require_tls: When True (with other security parameters), refuse plaintext fallback.
+            timeout: Security negotiation timeout in seconds. Passing ``timeout`` alone does
+                not enable security negotiation; at least one of ``credential_store``,
+                ``on_trust_prompt``, or ``require_tls=True`` is required.
         """
         # Configure logging in case it hasn't been done yet
         configure_logging()
@@ -146,7 +179,64 @@ class TekHSIConnect:  # pylint:disable=too-many-instance-attributes
         # samples inside the digital read branch below, so the rest of the
         # pipeline always sees the same int8 layout regardless of probe.
         self.d_datatypes = {1: np.int8}
-        self.channel = grpc.insecure_channel(url)
+
+        _legacy_plain = (
+            credentials is None
+            and credential_store is None
+            and on_trust_prompt is None
+            and not require_tls
+        )
+        if _legacy_plain:
+            self.channel = grpc.insecure_channel(url)
+            self._credential_store_ref = None
+            self._on_trust_ref = None
+            self._auto_security = False
+        else:
+            deadline = time.time() + max(1.0, float(timeout))
+            store_for_auto = (
+                credential_store if credential_store is not None else TekCredentialStore()
+            )
+            if credentials is not None:
+                if isinstance(credentials, TekHSICredentials) and getattr(
+                    credentials, "_use_store", False
+                ):
+                    if credential_store is None:
+                        msg = "credential_store is required when credentials use the store"
+                        raise ValueError(msg)
+                    creds = _resolve_credentials_from_store(
+                        url,
+                        credential_store,
+                        credentials._store_mode,  # noqa: SLF001
+                        on_trust_prompt,
+                        deadline,
+                    )
+                    entry = credential_store.get(url)
+                    self.channel = _secure_channel(url, creds, entry=entry)
+                    self._credential_store_ref = credential_store
+                    self._on_trust_ref = on_trust_prompt
+                    self._auto_security = True
+                else:
+                    if isinstance(credentials, TekHSICredentials):
+                        creds = credentials._grpc_credentials()  # noqa: SLF001
+                    else:
+                        creds = credentials
+                    tls_name = (
+                        credentials._tls_server_name  # noqa: SLF001
+                        if isinstance(credentials, TekHSICredentials)
+                        else None
+                    )
+                    self.channel = _secure_channel(url, creds, tls_server_name=tls_name)
+                    self._credential_store_ref = store_for_auto
+                    self._on_trust_ref = None
+                    self._auto_security = False
+            else:
+                self.channel = _auto_negotiate_channel(
+                    url, store_for_auto, on_trust_prompt, require_tls, deadline, timeout
+                )
+                self._credential_store_ref = store_for_auto
+                self._on_trust_ref = on_trust_prompt
+                self._auto_security = True
+
         self.clientname = str(uuid.uuid4())
         self.connection = ConnectStub(self.channel)
         self.native = NativeDataStub(self.channel)
@@ -472,7 +562,8 @@ class TekHSIConnect:  # pylint:disable=too-many-instance-attributes
 
         _logger.debug("close")
 
-        # Call force_sequence while still connected to unblock the background thread's
+        # Call force_sequence while still connected so it can run. This asks the
+        # server to provide new data and unblocks the background thread's
         # WaitForDataAccess so it can exit. Do this before setting _connected=False.
         try:
             self.force_sequence()
@@ -665,10 +756,101 @@ class TekHSIConnect:  # pylint:disable=too-many-instance-attributes
         return response.symbolnames
 
     def _connect(self) -> None:
-        """Request connect to the gRCP server."""
+        """Connect to the gRPC server, upgrading to Mode 3 if the server demands auth."""
         _logger.debug("connect")
         request = ConnectRequest(name=self.clientname)
-        self.connection.Connect(request)
+        upgrade_done = False
+        while True:
+            try:
+                self.connection.Connect(request)
+            except grpc.RpcError as e:
+                if (
+                    e.code() == grpc.StatusCode.UNAUTHENTICATED
+                    and getattr(self, "_auto_security", False)
+                    and not upgrade_done
+                ):
+                    self._upgrade_channel_with_token_after_unauthenticated()
+                    upgrade_done = True
+                    continue
+                if e.code() == grpc.StatusCode.UNAUTHENTICATED:
+                    if getattr(self, "_auto_security", False):
+                        detail = (e.details() or "").strip() or "UNAUTHENTICATED"
+                        if upgrade_done:
+                            detail = (
+                                f"{detail} "
+                                "(Check Mode 3 password matches the server's --password; "
+                                f"Basic username defaults to {DEFAULT_MODE3_USERNAME}.)"
+                            )
+                        raise TekAuthenticationFailed(self.url, detail) from e
+                    raise
+                raise
+            return
+
+    @staticmethod
+    def _parse_auth_prompt_result(result: object, url: str) -> tuple[str, str | None]:
+        """Parse `on_trust_prompt` result for auth-required flow."""
+        login_index = 2
+        password: str | None = None
+        login: str | None = None
+
+        if isinstance(result, (list, tuple)):
+            if len(result) >= 1 and result[0]:
+                password = result[1] if len(result) > 1 else None
+                if not (login := result[login_index] if len(result) > login_index else None):
+                    login = None
+        elif result is True:
+            password = None
+        else:
+            raise TekAuthenticationFailed(url, "Authentication declined in on_trust_prompt.")
+
+        if not password:
+            raise TekAuthenticationFailed(
+                url,
+                "Server requires a password; when auth_required is True, return "
+                "(True, password) or (True, password, login) from on_trust_prompt.",
+            )
+
+        return password, login
+
+    def _upgrade_channel_with_token_after_unauthenticated(self) -> None:
+        """After Connect returns UNAUTHENTICATED on TLS, prompt for password and retry channel."""
+        store = self._credential_store_ref
+        cb = self._on_trust_ref
+        if store is None or cb is None:
+            raise TekAuthenticationFailed(
+                self.url,
+                "Authentication required; provide on_trust_prompt or store password for this host.",
+            )
+        entry = store.get(self.url)
+        if not entry or not entry.get("cert_path"):
+            raise TekAuthenticationFailed(
+                self.url,
+                "Authentication required but no stored certificate for this host.",
+            )
+        host, port = _parse_host_port(self.url)
+        live = _fetch_server_cert(host, port, timeout=8.0)
+        fp = entry.get("cert_fingerprint")
+        if fp and live.cert_fingerprint != fp:
+            raise TekCertificateMismatch(self.url, fp, live.cert_fingerprint)
+        result = _call_on_trust(cb, self.url, live, auth_required=True)
+        password, login = self._parse_auth_prompt_result(result, self.url)
+        store.set(
+            self.url,
+            password=password,
+            login=login if login is not None else DEFAULT_MODE3_USERNAME,
+        )
+        store.save()
+        entry2 = store.get(self.url)
+        if not entry2 or not entry2.get("cert_path"):
+            msg = "Store update failed after authentication prompt."
+            raise TekSecurityError(msg)
+        with contextlib.suppress(Exception):
+            self.channel.close()
+        self.channel = _secure_channel(
+            self.url, _build_creds_from_entry(entry2, "token"), entry=entry2
+        )
+        self.connection = ConnectStub(self.channel)
+        self.native = NativeDataStub(self.channel)
 
     def _disconnect(self) -> None:
         """Disconnect from gRPC server."""
