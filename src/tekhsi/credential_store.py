@@ -182,7 +182,7 @@ class TekHSICredentialStore:
     def get(self, host: str) -> dict[str, str | None] | None:
         """Return entry for host or None if not found."""
         key = self._normalize_host(host)
-        if raw := self._data.get(key):
+        if not (raw := self._data.get(key)):
             return None
         return {
             "cert_fingerprint": raw.get("cert_fingerprint") or None,
