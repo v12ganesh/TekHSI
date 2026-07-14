@@ -1,5 +1,4 @@
 """Unit tests for TekHSIConnect security helpers (Mode 3 upgrade path)."""
-# pylint: disable=missing-function-docstring
 
 from __future__ import annotations
 
@@ -30,6 +29,7 @@ from tekhsi.tek_hsi_connect import TekHSIConnect
     ],
 )
 def test_parse_auth_prompt_result_valid(result: Any, expected: tuple[str, str | None]) -> None:
+    """Valid prompt results yield the expected (password, login) tuple."""
     assert TekHSIConnect._parse_auth_prompt_result(result, "host") == expected
 
 
@@ -38,6 +38,7 @@ def test_parse_auth_prompt_result_valid(result: Any, expected: tuple[str, str | 
     [True, (True,), (True, None), (True, ""), False, (False,), None, 0, "no"],
 )
 def test_parse_auth_prompt_result_declined_or_no_password(result: Any) -> None:
+    """Declined prompts or missing passwords raise TekAuthenticationFailed."""
     with pytest.raises(TekAuthenticationFailed):
         TekHSIConnect._parse_auth_prompt_result(result, "host")
 
@@ -59,12 +60,14 @@ def _make_bare_client() -> TekHSIConnect:
 
 
 def test_upgrade_missing_store_or_callback_raises() -> None:
+    """Upgrade fails when no credential store or trust callback is configured."""
     client = _make_bare_client()
     with pytest.raises(TekAuthenticationFailed, match="Authentication required"):
         client._upgrade_channel_with_token_after_unauthenticated()
 
 
 def test_upgrade_missing_cert_path_raises() -> None:
+    """Upgrade fails when the store has no stored cert_path for the host."""
     client = _make_bare_client()
     client._credential_store_ref = MagicMock()
     client._credential_store_ref.get.return_value = None
@@ -74,6 +77,7 @@ def test_upgrade_missing_cert_path_raises() -> None:
 
 
 def test_upgrade_fingerprint_mismatch_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Upgrade raises TekCertificateMismatch when live cert fingerprint differs from stored."""
     client = _make_bare_client()
     client._credential_store_ref = MagicMock()
     client._credential_store_ref.get.return_value = {
@@ -89,6 +93,7 @@ def test_upgrade_fingerprint_mismatch_raises(monkeypatch: pytest.MonkeyPatch) ->
 
 
 def test_upgrade_declined_prompt_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Upgrade raises TekAuthenticationFailed when the trust prompt declines."""
     client = _make_bare_client()
     client._credential_store_ref = MagicMock()
     client._credential_store_ref.get.return_value = {
@@ -104,6 +109,7 @@ def test_upgrade_declined_prompt_raises(monkeypatch: pytest.MonkeyPatch) -> None
 
 
 def test_upgrade_success_swaps_channel(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Successful upgrade persists credentials and swaps in the new secure channel."""
     client = _make_bare_client()
     old_channel = client.channel
     store = MagicMock()
@@ -136,6 +142,7 @@ def test_upgrade_success_swaps_channel(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_upgrade_store_lost_entry_raises_security_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Upgrade raises TekSecurityError when the store entry disappears after save."""
     client = _make_bare_client()
     store = MagicMock()
     entry = {"cert_path": "/tmp/x.pem", "cert_fingerprint": "fp"}
