@@ -23,7 +23,7 @@ from tekhsi import TekHSIConnect, TekHSICredentials
 if TYPE_CHECKING:
     from tm_data_types import AnalogWaveform
 
-addr = "10.233.237.4"  # Replace with the IP address of your instrument 192.168.0.1
+addr = "192.168.0.1"  # Replace with the IP address of your instrument 192.168.0.1
 channel = "ch2"  # Analog channel to plot
 url = f"{addr}:5000"
 

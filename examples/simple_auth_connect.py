@@ -13,7 +13,7 @@ import sys
 from auth_helpers import discover, guard_placeholder_addr, verify_password
 from tekhsi import TekHSIConnect, TekHSICredentials
 
-addr = "10.233.237.4"  # Replace with the IP address of your instrument
+addr = "192.168.0.1"  # Replace with the IP address of your instrument
 url = f"{addr}:5000"
 
 guard_placeholder_addr(addr)
